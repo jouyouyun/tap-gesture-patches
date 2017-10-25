@@ -1,0 +1,462 @@
+diff --git a/src/evdev-mt-touchpad-gestures.c b/src/evdev-mt-touchpad-gestures.c
+index a20b26d..53b882f 100644
+--- a/src/evdev-mt-touchpad-gestures.c
++++ b/src/evdev-mt-touchpad-gestures.c
+@@ -31,6 +31,7 @@
+ 
+ #define DEFAULT_GESTURE_SWITCH_TIMEOUT ms2us(100)
+ #define DEFAULT_GESTURE_2FG_SCROLL_TIMEOUT ms2us(150)
++#define DEFAULT_GESTURE_TAP_TIMEOUT ms2us(200)
+ 
+ static inline const char*
+ gesture_state_to_str(enum tp_gesture_state state)
+@@ -41,6 +42,7 @@ gesture_state_to_str(enum tp_gesture_state state)
+ 	CASE_RETURN_STRING(GESTURE_STATE_SCROLL);
+ 	CASE_RETURN_STRING(GESTURE_STATE_PINCH);
+ 	CASE_RETURN_STRING(GESTURE_STATE_SWIPE);
++	CASE_RETURN_STRING(GESTURE_STATE_TAP);
+ 	}
+ 	return NULL;
+ }
+@@ -120,6 +122,12 @@ tp_gesture_start(struct tp_dispatch *tp, uint64_t time)
+ 				     tp->gesture.finger_count,
+ 				     &zero, &zero);
+ 		break;
++  case GESTURE_STATE_TAP:
++    gesture_notify_tap(&tp->device->base, time,
++             LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++             tp->gesture.finger_count,
++             &zero, &zero);
++    break;
+ 	}
+ 
+ 	tp->gesture.started = true;
+@@ -351,8 +359,17 @@ tp_gesture_handle_state_unknown(struct tp_dispatch *tp, uint64_t time)
+ 	/* Else wait for both fingers to have moved */
+ 	dir1 = tp_gesture_get_direction(tp, first, tp->gesture.finger_count);
+ 	dir2 = tp_gesture_get_direction(tp, second, tp->gesture.finger_count);
+-	if (dir1 == UNDEFINED_DIRECTION || dir2 == UNDEFINED_DIRECTION)
+-		return GESTURE_STATE_UNKNOWN;
++	if (dir1 == UNDEFINED_DIRECTION || dir2 == UNDEFINED_DIRECTION) {
++      struct normalized_coords delta, unaccel;
++      unaccel = tp_get_average_touches_delta(tp);
++      delta = tp_filter_motion(tp, &unaccel, time);
++      if (normalized_is_zero(delta) && normalized_is_zero(unaccel) &&
++          time < (tp->gesture.initial_time + DEFAULT_GESTURE_TAP_TIMEOUT)) {
++          // TODO: check tap whether enabled
++          return GESTURE_STATE_TAP;
++      }
++      return GESTURE_STATE_UNKNOWN;
++  }
+ 
+ 	/* If both touches are moving in the same direction assume
+ 	 * scroll or swipe */
+@@ -453,6 +470,53 @@ tp_gesture_handle_state_pinch(struct tp_dispatch *tp, uint64_t time)
+ 	return GESTURE_STATE_PINCH;
+ }
+ 
++static enum tp_gesture_state
++tp_gesture_handle_state_tap(struct tp_dispatch *tp, uint64_t time)
++{
++	struct normalized_coords delta, unaccel;
++	struct tp_touch *first = tp->gesture.touches[0],
++			*second = tp->gesture.touches[1];
++	int dir1, dir2;
++
++	if (time > (tp->gesture.initial_time + DEFAULT_GESTURE_TAP_TIMEOUT)) {
++		goto out;
++	}
++
++	unaccel = tp_get_average_touches_delta(tp);
++	delta = tp_filter_motion(tp, &unaccel, time);
++	if (normalized_is_zero(delta) && normalized_is_zero(unaccel)) {
++		tp_gesture_start(tp, time);
++		gesture_notify_tap(&tp->device->base, time,
++				LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++        tp->gesture.finger_count,
++        &delta, &unaccel);
++		return GESTURE_STATE_TAP;
++	}
++
++out:
++	// TODO: optimize structure
++
++	/* Else wait for both fingers to have moved */
++	dir1 = tp_gesture_get_direction(tp, first, tp->gesture.finger_count);
++	dir2 = tp_gesture_get_direction(tp, second, tp->gesture.finger_count);
++
++	/* If both touches are moving in the same direction assume
++	 * scroll or swipe */
++	if (tp_gesture_same_directions(dir1, dir2)) {
++		if (tp->gesture.finger_count == 2) {
++			tp_gesture_set_scroll_buildup(tp);
++			return GESTURE_STATE_SCROLL;
++		} else if (tp->gesture.enabled) {
++			return GESTURE_STATE_SWIPE;
++		}
++	} else {
++		tp_gesture_init_pinch(tp);
++		return GESTURE_STATE_PINCH;
++	}
++
++	return GESTURE_STATE_UNKNOWN;
++}
++
+ static void
+ tp_gesture_post_gesture(struct tp_dispatch *tp, uint64_t time)
+ {
+@@ -478,6 +542,10 @@ tp_gesture_post_gesture(struct tp_dispatch *tp, uint64_t time)
+ 		tp->gesture.state =
+ 			tp_gesture_handle_state_pinch(tp, time);
+ 
++  if (tp->gesture.state == GESTURE_STATE_TAP)
++      tp->gesture.state =
++          tp_gesture_handle_state_tap(tp, time);
++
+ 	evdev_log_debug(tp->device,
+ 			"gesture state: %s → %s\n",
+ 			gesture_state_to_str(oldstate),
+@@ -557,6 +625,12 @@ tp_gesture_end(struct tp_dispatch *tp, uint64_t time, bool cancelled)
+ 					 tp->gesture.finger_count,
+ 					 cancelled);
+ 		break;
++  case GESTURE_STATE_TAP:
++      gesture_notify_tap_end(&tp->device->base,
++                             time,
++                             tp->gesture.finger_count,
++                             cancelled);
++      break;
+ 	}
+ 
+ 	tp->gesture.started = false;
+diff --git a/src/evdev-mt-touchpad.h b/src/evdev-mt-touchpad.h
+index 2873c01..0cac1d8 100644
+--- a/src/evdev-mt-touchpad.h
++++ b/src/evdev-mt-touchpad.h
+@@ -130,6 +130,7 @@ enum tp_gesture_state {
+ 	GESTURE_STATE_SCROLL,
+ 	GESTURE_STATE_PINCH,
+ 	GESTURE_STATE_SWIPE,
++	GESTURE_STATE_TAP,
+ };
+ 
+ enum tp_thumb_state {
+diff --git a/src/libinput-private.h b/src/libinput-private.h
+index 1a564f9..45dc07f 100644
+--- a/src/libinput-private.h
++++ b/src/libinput-private.h
+@@ -560,20 +560,34 @@ gesture_notify_swipe_end(struct libinput_device *device,
+ 
+ void
+ gesture_notify_pinch(struct libinput_device *device,
+-		     uint64_t time,
+-		     enum libinput_event_type type,
+-		     int finger_count,
+-		     const struct normalized_coords *delta,
+-		     const struct normalized_coords *unaccel,
+-		     double scale,
+-		     double angle);
++                     uint64_t time,
++                     enum libinput_event_type type,
++                     int finger_count,
++                     const struct normalized_coords *delta,
++                     const struct normalized_coords *unaccel,
++                     double scale,
++                     double angle);
+ 
+ void
+ gesture_notify_pinch_end(struct libinput_device *device,
+-			 uint64_t time,
+-			 int finger_count,
+-			 double scale,
+-			 int cancelled);
++                         uint64_t time,
++                         int finger_count,
++                         double scale,
++                         int cancelled);
++
++void
++gesture_notify_tap(struct libinput_device *device,
++                     uint64_t time,
++                     enum libinput_event_type type,
++                     int finger_count,
++                     const struct normalized_coords *delta,
++                     const struct normalized_coords *unaccel);
++
++void
++gesture_notify_tap_end(struct libinput_device *device,
++                         uint64_t time,
++                         int finger_count,
++                         int cancelled);
+ 
+ void
+ tablet_notify_axis(struct libinput_device *device,
+diff --git a/src/libinput.c b/src/libinput.c
+index f221b6a..94209be 100644
+--- a/src/libinput.c
++++ b/src/libinput.c
+@@ -134,6 +134,9 @@ event_type_to_str(enum libinput_event_type type)
+ 	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_PINCH_BEGIN);
+ 	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_PINCH_UPDATE);
+ 	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_PINCH_END);
++	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_TAP_BEGIN);
++	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_TAP_UPDATE);
++	CASE_RETURN_STRING(LIBINPUT_EVENT_GESTURE_TAP_END);
+ 	CASE_RETURN_STRING(LIBINPUT_EVENT_SWITCH_TOGGLE);
+ 	case LIBINPUT_EVENT_NONE:
+ 		abort();
+@@ -397,7 +400,10 @@ libinput_event_get_gesture_event(struct libinput_event *event)
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_END,
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_PINCH_END);
++         LIBINPUT_EVENT_GESTURE_PINCH_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return (struct libinput_event_gesture *) event;
+ }
+@@ -883,7 +889,10 @@ libinput_event_gesture_get_time(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return us2ms(event->time);
+ }
+@@ -899,7 +908,10 @@ libinput_event_gesture_get_time_usec(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->time;
+ }
+@@ -915,7 +927,10 @@ libinput_event_gesture_get_finger_count(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->finger_count;
+ }
+@@ -927,7 +942,8 @@ libinput_event_gesture_get_cancelled(struct libinput_event_gesture *event)
+ 			   event->base.type,
+ 			   0,
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->cancelled;
+ }
+@@ -943,7 +959,10 @@ libinput_event_gesture_get_dx(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->delta.x;
+ }
+@@ -959,7 +978,10 @@ libinput_event_gesture_get_dy(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->delta.y;
+ }
+@@ -976,7 +998,10 @@ libinput_event_gesture_get_dx_unaccelerated(
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->delta_unaccel.x;
+ }
+@@ -993,7 +1018,10 @@ libinput_event_gesture_get_dy_unaccelerated(
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_END,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_SWIPE_END);
++         LIBINPUT_EVENT_GESTURE_SWIPE_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return event->delta_unaccel.y;
+ }
+@@ -2741,6 +2769,29 @@ gesture_notify_pinch_end(struct libinput_device *device,
+ }
+ 
+ void
++gesture_notify_tap(struct libinput_device *device,
++                   uint64_t time,
++                   enum libinput_event_type type,
++                   int finger_count,
++                   const struct normalized_coords *delta,
++                   const struct normalized_coords *unaccel)
++{
++    gesture_notify(device, time, type, finger_count, 0,
++                   delta, unaccel, 0.0, 0.0);
++}
++
++void
++gesture_notify_tap_end(struct libinput_device *device,
++                       uint64_t time,
++                       int finger_count,
++                       int cancelled)
++{
++    const struct normalized_coords zero = { 0.0, 0.0 };
++    gesture_notify(device, time, LIBINPUT_EVENT_GESTURE_TAP_END,
++                   finger_count, cancelled, &zero, &zero, 0.0, 0.0);
++}
++
++void
+ switch_notify_toggle(struct libinput_device *device,
+ 		     uint64_t time,
+ 		     enum libinput_switch sw,
+@@ -3180,7 +3231,10 @@ libinput_event_gesture_get_base_event(struct libinput_event_gesture *event)
+ 			   LIBINPUT_EVENT_GESTURE_SWIPE_END,
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
+ 			   LIBINPUT_EVENT_GESTURE_PINCH_UPDATE,
+-			   LIBINPUT_EVENT_GESTURE_PINCH_END);
++         LIBINPUT_EVENT_GESTURE_PINCH_END,
++         LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++         LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++         LIBINPUT_EVENT_GESTURE_TAP_END);
+ 
+ 	return &event->base;
+ }
+diff --git a/src/libinput.h b/src/libinput.h
+index 6b63d47..4b85d16 100644
+--- a/src/libinput.h
++++ b/src/libinput.h
+@@ -789,6 +789,9 @@ enum libinput_event_type {
+ 	LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
+ 	LIBINPUT_EVENT_GESTURE_PINCH_UPDATE,
+ 	LIBINPUT_EVENT_GESTURE_PINCH_END,
++	LIBINPUT_EVENT_GESTURE_TAP_BEGIN,
++	LIBINPUT_EVENT_GESTURE_TAP_UPDATE,
++	LIBINPUT_EVENT_GESTURE_TAP_END,
+ 
+ 	LIBINPUT_EVENT_SWITCH_TOGGLE = 900,
+ };
+diff --git a/test/litest.c b/test/litest.c
+index 3cb3f38..b6f6592 100644
+--- a/test/litest.c
++++ b/test/litest.c
+@@ -2457,6 +2457,15 @@ litest_event_type_str(enum libinput_event_type type)
+ 	case LIBINPUT_EVENT_GESTURE_PINCH_END:
+ 		str = "GESTURE PINCH END";
+ 		break;
++	case LIBINPUT_EVENT_GESTURE_TAP_BEGIN:
++      str = "GESTURE TAP START";
++      break;
++	case LIBINPUT_EVENT_GESTURE_TAP_UPDATE:
++      str = "GESTURE TAP UPDATE";
++      break;
++	case LIBINPUT_EVENT_GESTURE_TAP_END:
++      str = "GESTURE TAP END";
++      break;
+ 	case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
+ 		str = "TABLET TOOL AXIS";
+ 		break;
+diff --git a/tools/libinput-debug-events.c b/tools/libinput-debug-events.c
+index a54ff55..a258007 100644
+--- a/tools/libinput-debug-events.c
++++ b/tools/libinput-debug-events.c
+@@ -118,6 +118,15 @@ print_event_header(struct libinput_event *ev)
+ 	case LIBINPUT_EVENT_GESTURE_PINCH_END:
+ 		type = "GESTURE_PINCH_END";
+ 		break;
++	case LIBINPUT_EVENT_GESTURE_TAP_BEGIN:
++      type = "GESTURE_TAP_BEGIN";
++      break;
++	case LIBINPUT_EVENT_GESTURE_TAP_UPDATE:
++      type = "GESTURE_TAP_UPDATE";
++      break;
++	case LIBINPUT_EVENT_GESTURE_TAP_END:
++      type = "GESTURE_TAP_END";
++      break;
+ 	case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
+ 		type = "TABLET_TOOL_AXIS";
+ 		break;
+@@ -624,7 +633,8 @@ print_gesture_event_without_coords(struct libinput_event *ev)
+ 	type = libinput_event_get_type(ev);
+ 
+ 	if (type == LIBINPUT_EVENT_GESTURE_SWIPE_END ||
+-	    type == LIBINPUT_EVENT_GESTURE_PINCH_END)
++	    type == LIBINPUT_EVENT_GESTURE_PINCH_END ||
++      type == LIBINPUT_EVENT_GESTURE_TAP_END)
+ 	    cancelled = libinput_event_gesture_get_cancelled(t);
+ 
+ 	print_event_time(libinput_event_gesture_get_time(t));
+@@ -823,6 +833,15 @@ handle_and_print_events(struct libinput *li)
+ 		case LIBINPUT_EVENT_GESTURE_PINCH_END:
+ 			print_gesture_event_without_coords(ev);
+ 			break;
++		case LIBINPUT_EVENT_GESTURE_TAP_BEGIN:
++        print_gesture_event_without_coords(ev);
++        break;
++		case LIBINPUT_EVENT_GESTURE_TAP_UPDATE:
++        print_gesture_event_with_coords(ev);
++        break;
++		case LIBINPUT_EVENT_GESTURE_TAP_END:
++        print_gesture_event_without_coords(ev);
++        break;
+ 		case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
+ 			print_tablet_axis_event(ev);
+ 			break;
+diff --git a/tools/libinput-debug-gui.c b/tools/libinput-debug-gui.c
+index 98d706b..fed1f3b 100644
+--- a/tools/libinput-debug-gui.c
++++ b/tools/libinput-debug-gui.c
+@@ -89,6 +89,10 @@ struct window {
+ 		double x, y;
+ 	} pinch;
+ 
++  struct {
++      int nfingers;
++  } tap;
++
+ 	struct {
+ 		double x, y;
+ 		double x_in, y_in;
+@@ -831,6 +835,11 @@ handle_event_libinput(GIOChannel *source, GIOCondition condition, gpointer data)
+ 		case LIBINPUT_EVENT_GESTURE_PINCH_END:
+ 			handle_event_pinch(ev, w);
+ 			break;
++		case LIBINPUT_EVENT_GESTURE_TAP_BEGIN:
++		case LIBINPUT_EVENT_GESTURE_TAP_UPDATE:
++		case LIBINPUT_EVENT_GESTURE_TAP_END:
++        // TODO: draw tap gesture
++        break;
+ 		case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
+ 		case LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY:
+ 		case LIBINPUT_EVENT_TABLET_TOOL_TIP:
