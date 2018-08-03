@@ -1,5 +1,5 @@
 diff --git a/src/evdev-mt-touchpad-gestures.c b/src/evdev-mt-touchpad-gestures.c
-index 37682fb4..43d253c1 100644
+index 37682fb4..1a4fd3aa 100644
 --- a/src/evdev-mt-touchpad-gestures.c
 +++ b/src/evdev-mt-touchpad-gestures.c
 @@ -31,6 +31,10 @@
@@ -33,29 +33,31 @@ index 37682fb4..43d253c1 100644
  	}
  
  	tp->gesture.started = true;
-@@ -358,8 +368,19 @@ tp_gesture_handle_state_unknown(struct tp_dispatch *tp, uint64_t time)
+@@ -358,8 +368,21 @@ tp_gesture_handle_state_unknown(struct tp_dispatch *tp, uint64_t time)
  	/* Else wait for both fingers to have moved */
  	dir1 = tp_gesture_get_direction(tp, first, tp->gesture.finger_count);
  	dir2 = tp_gesture_get_direction(tp, second, tp->gesture.finger_count);
 -	if (dir1 == UNDEFINED_DIRECTION || dir2 == UNDEFINED_DIRECTION)
 -		return GESTURE_STATE_UNKNOWN;
 +	if (dir1 == UNDEFINED_DIRECTION || dir2 == UNDEFINED_DIRECTION) {
-+                struct device_float_coords raw;
-+                struct normalized_coords delta, unaccel;
-+                raw = tp_get_average_touches_delta(tp);
-+                delta = tp_filter_motion(tp, &raw, time);
-+                unaccel = tp_normalize_delta(tp, raw);
-+                if (is_gesture_tap_event(&delta, &unaccel) &&
-+                    time < (tp->gesture.initial_time + DEFAULT_GESTURE_TAP_TIMEOUT)) {
-+                    // TODO: check tap whether enabled
-+                    return GESTURE_STATE_TAP;
-+                }
++		// For tap gesture
++		if (time < (tp->gesture.initial_time + DEFAULT_GESTURE_TAP_TIMEOUT)) {
++			struct device_float_coords raw;
++			struct normalized_coords delta, unaccel;
++			raw = tp_get_average_touches_delta(tp);
++			delta = tp_filter_motion(tp, &raw, time);
++			unaccel = tp_normalize_delta(tp, raw);
++			if (is_gesture_tap_event(&delta, &unaccel)) {
++				// TODO: check tap whether enabled
++				return GESTURE_STATE_TAP;
++			}
++		}
 +                return GESTURE_STATE_UNKNOWN;
-+        }
++	}
  
  	/* If both touches are moving in the same direction assume
  	 * scroll or swipe */
-@@ -426,6 +447,54 @@ tp_gesture_handle_state_swipe(struct tp_dispatch *tp, uint64_t time)
+@@ -426,6 +449,57 @@ tp_gesture_handle_state_swipe(struct tp_dispatch *tp, uint64_t time)
  	return GESTURE_STATE_SWIPE;
  }
  
@@ -89,6 +91,9 @@ index 37682fb4..43d253c1 100644
 +	/* Else wait for both fingers to have moved */
 +	dir1 = tp_gesture_get_direction(tp, first, tp->gesture.finger_count);
 +	dir2 = tp_gesture_get_direction(tp, second, tp->gesture.finger_count);
++	if (dir1 == UNDEFINED_DIRECTION || dir2 == UNDEFINED_DIRECTION) {
++		return GESTURE_STATE_UNKNOWN;
++	}
 +
 +	/* If both touches are moving in the same direction assume
 +	 * scroll or swipe */
@@ -110,7 +115,7 @@ index 37682fb4..43d253c1 100644
  static enum tp_gesture_state
  tp_gesture_handle_state_pinch(struct tp_dispatch *tp, uint64_t time)
  {
-@@ -490,6 +559,10 @@ tp_gesture_post_gesture(struct tp_dispatch *tp, uint64_t time)
+@@ -490,6 +564,10 @@ tp_gesture_post_gesture(struct tp_dispatch *tp, uint64_t time)
  		tp->gesture.state =
  			tp_gesture_handle_state_pinch(tp, time);
  
@@ -121,7 +126,7 @@ index 37682fb4..43d253c1 100644
  	evdev_log_debug(tp->device,
  			"gesture state: %s → %s\n",
  			gesture_state_to_str(oldstate),
-@@ -569,6 +642,12 @@ tp_gesture_end(struct tp_dispatch *tp, uint64_t time, bool cancelled)
+@@ -569,6 +647,12 @@ tp_gesture_end(struct tp_dispatch *tp, uint64_t time, bool cancelled)
  					 tp->gesture.finger_count,
  					 cancelled);
  		break;
@@ -134,7 +139,7 @@ index 37682fb4..43d253c1 100644
  	}
  
  	tp->gesture.started = false;
-@@ -658,3 +737,13 @@ tp_remove_gesture(struct tp_dispatch *tp)
+@@ -658,3 +742,13 @@ tp_remove_gesture(struct tp_dispatch *tp)
  {
  	libinput_timer_cancel(&tp->gesture.finger_count_switch_timer);
  }
